@@ -55,6 +55,7 @@ They work in both YAML and TOML, but they only matter for compatibility if you s
     - [`repo: builtin`](#prek-only-repo-builtin)
 - Hook-level:
     - [`env`](#prek-only-env)
+    - [`shell`](#shell)
     - [`priority`](#prek-only-priority)
     - [`minimum_prek_version`](#prek-only-minimum-prek-version-hook)
 
@@ -863,6 +864,81 @@ The command line to execute for the hook.
 
 If `pass_filenames: true`, `prek` appends matching filenames to this command when running.
 
+#### `shell`
+
+<a id="prek-only-shell"></a>
+
+!!! note "prek-only"
+
+    `shell` is a `prek` extension and may not be recognized by upstream `pre-commit`.
+
+Run `entry` through a predefined shell adapter.
+
+- Type: one of `sh`, `bash`, `pwsh`, `powershell`, `cmd`
+- Default: `null` (run `entry` directly without a shell)
+
+When `shell` is omitted, `prek` preserves the default no-shell behavior: it parses `entry` into argv, invokes the command directly, and appends `args` and matching filenames as process arguments.
+
+When `shell` is set, `entry` is treated as source for that shell. `prek` writes the source to a temporary script file, runs it with the selected shell adapter, and passes hook `args` followed by matching filenames as script arguments.
+
+| `shell` | Adapter command | Script arguments |
+| -- | -- | -- |
+| `bash` | `bash --noprofile --norc -eo pipefail <script>` | `"$@"` |
+| `sh` | `sh -e <script>` | `"$@"` |
+| `pwsh` | `pwsh -NoProfile -NonInteractive -File <script>` | `$args` |
+| `powershell` | `powershell -NoProfile -NonInteractive -File <script>` | `$args` |
+| `cmd` | `cmd /D /E:ON /V:OFF /S /C CALL <script>` | `%*` |
+
+=== "prek.toml"
+
+    ```toml
+    [[repos]]
+    repo = "local"
+    hooks = [
+      {
+        id = "test-all",
+        name = "test-all",
+        language = "system",
+        entry = """
+        uv run --python=3.10 --isolated pytest
+        uv run --python=3.11 --isolated pytest
+        """,
+        shell = "bash",
+        pass_filenames = false,
+      },
+    ]
+    ```
+
+=== ".pre-commit-config.yaml"
+
+    ```yaml
+    repos:
+      - repo: local
+        hooks:
+          - id: test-all
+            name: test-all
+            language: system
+            entry: |
+              uv run --python=3.10 --isolated pytest
+              uv run --python=3.11 --isolated pytest
+            shell: bash
+            pass_filenames: false
+    ```
+
+??? note "Unsupported languages"
+
+    `shell` is rejected for language backends that do not run `entry` through
+    the shell-aware entry resolver, and for `repo: meta` and `repo: builtin`
+    hooks.
+
+    | Language | Why `shell` is unsupported |
+    | -- | -- |
+    | `docker`, `docker_image` | `entry` participates in container image or entrypoint selection instead of direct host process execution. |
+    | `fail` | `entry` is the failure message body. |
+    | `julia`, `rust` | `entry` participates in install/runtime package resolution and is split before execution. |
+    | `pygrep` | `entry` is the regex pattern. |
+    | `conda`, `coursier`, `dart`, `perl`, `r` | The language backend is not implemented yet. |
+
 #### `language`
 
 How `prek` should run the hook (and whether it should create a managed environment).
@@ -1119,6 +1195,10 @@ Set `pass_filenames: false` for hooks that don’t accept file arguments (or tha
 Set `pass_filenames: n` (a positive integer) to limit each invocation to at most `n` filenames. When there are more matching files than `n`, `prek` splits them across multiple invocations. Those invocations may run concurrently unless `require_serial: true` is set. This is useful for tools that can only process a limited number of files at once.
 
 Prek will automatically limit the number of filenames to ensure command lines don’t exceed the OS limit, even when `pass_filenames: true`.
+
+!!! note "prek-only"
+
+    `pass_filenames: n` with a positive integer is a `prek` extension. Upstream `pre-commit` only accepts a boolean value.
 
 #### `stages`
 

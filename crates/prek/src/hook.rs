@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -18,8 +17,9 @@ use crate::config::{
     self, BuiltinHook, Config, FilePattern, HookOptions, Language, LocalHook, ManifestHook,
     MetaHook, PassFilenames, RemoteHook, Stages, read_manifest,
 };
+use crate::hook_entry::HookEntry;
 use crate::languages::version::LanguageRequest;
-use crate::languages::{extract_metadata, resolve_command};
+use crate::languages::{ShellSupport, extract_metadata};
 use crate::store::Store;
 use crate::workspace::Project;
 
@@ -266,6 +266,7 @@ impl HookBuilder {
         let HookOptions {
             language_version,
             additional_dependencies,
+            shell,
             ..
         } = &self.hook_spec.options;
 
@@ -310,6 +311,37 @@ impl HookBuilder {
             }
         }
 
+        if shell.is_some() {
+            match self.repo.as_ref() {
+                Repo::Meta { .. } => {
+                    return Err(Error::Hook {
+                        hook: self.hook_spec.id.clone(),
+                        error: anyhow::anyhow!(
+                            "Hook specified `shell` but meta hooks do not support shell execution",
+                        ),
+                    });
+                }
+                Repo::Builtin { .. } => {
+                    return Err(Error::Hook {
+                        hook: self.hook_spec.id.clone(),
+                        error: anyhow::anyhow!(
+                            "Hook specified `shell` but builtin hooks do not support shell execution",
+                        ),
+                    });
+                }
+                Repo::Remote { .. } | Repo::Local { .. } => {}
+            }
+
+            if let ShellSupport::Unsupported(reason) = language.shell_support() {
+                return Err(Error::Hook {
+                    hook: self.hook_spec.id.clone(),
+                    error: anyhow::anyhow!(
+                        "Hook specified `shell` but the language `{language}` does not support shell execution: {reason}",
+                    ),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -333,6 +365,7 @@ impl HookBuilder {
         let require_serial = options.require_serial.unwrap_or(false);
         let verbose = options.verbose.unwrap_or(false);
         let stages = options.stages.unwrap_or(Stages::ALL);
+        let shell = options.shell;
         let additional_dependencies = options
             .additional_dependencies
             .unwrap_or_default()
@@ -345,7 +378,7 @@ impl HookBuilder {
             error: anyhow::anyhow!(e),
         })?;
 
-        let entry = Entry::new(self.hook_spec.id.clone(), self.hook_spec.entry);
+        let entry = HookEntry::new(self.hook_spec.id.clone(), self.hook_spec.entry, shell);
 
         let priority = self
             .hook_spec
@@ -397,45 +430,6 @@ impl HookBuilder {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct Entry {
-    hook: String,
-    entry: String,
-}
-
-impl Entry {
-    pub(crate) fn new(hook: String, entry: String) -> Self {
-        Self { hook, entry }
-    }
-
-    /// Split the entry and resolve the command by parsing its shebang.
-    pub(crate) fn resolve(&self, env_path: Option<&OsStr>) -> Result<Vec<String>, Error> {
-        let split = self.split()?;
-
-        Ok(resolve_command(split, env_path))
-    }
-
-    /// Split the entry into a list of commands.
-    pub(crate) fn split(&self) -> Result<Vec<String>, Error> {
-        let splits = shlex::split(&self.entry).ok_or_else(|| Error::Hook {
-            hook: self.hook.clone(),
-            error: anyhow::anyhow!("Failed to parse entry `{}` as commands", &self.entry),
-        })?;
-        if splits.is_empty() {
-            return Err(Error::Hook {
-                hook: self.hook.clone(),
-                error: anyhow::anyhow!("Failed to parse entry: entry is empty"),
-            });
-        }
-        Ok(splits)
-    }
-
-    /// Get the original entry string.
-    pub(crate) fn raw(&self) -> &str {
-        &self.entry
-    }
-}
-
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub(crate) struct Hook {
@@ -448,7 +442,7 @@ pub(crate) struct Hook {
     pub idx: usize,
     pub id: String,
     pub name: String,
-    pub entry: Entry,
+    pub entry: HookEntry,
     pub language: Language,
     pub alias: String,
     pub files: Option<FilePattern>,
@@ -843,7 +837,9 @@ mod tests {
     use prek_identify::tags;
     use rustc_hash::FxHashMap;
 
-    use crate::config::{Config, HookOptions, Language, PassFilenames, RemoteHook, Stage, Stages};
+    use crate::config::{
+        Config, HookOptions, Language, PassFilenames, RemoteHook, Shell, Stage, Stages,
+    };
     use crate::hook::HookSpec;
     use crate::languages::version::LanguageRequest;
     use crate::workspace::Project;
@@ -872,7 +868,7 @@ mod tests {
         )?);
         let repo = Arc::new(Repo::Local { hooks: vec![] });
 
-        // Base hook spec (e.g. from a manifest): minimal options, one env var.
+        // Base hook spec (e.g. from a manifest): options that config can merge or override.
         let mut base_env = FxHashMap::default();
         base_env.insert("BASE".to_string(), "1".to_string());
 
@@ -884,6 +880,7 @@ mod tests {
             priority: None,
             options: HookOptions {
                 env: Some(base_env),
+                shell: Some(Shell::Sh),
                 ..Default::default()
             },
         };
@@ -907,6 +904,7 @@ mod tests {
                 pass_filenames: Some(PassFilenames::None),
                 verbose: Some(true),
                 description: Some("desc".to_string()),
+                shell: Some(Shell::Bash),
                 ..Default::default()
             },
         };
@@ -952,10 +950,13 @@ mod tests {
             idx: 7,
             id: "test-hook",
             name: "override-name",
-            entry: Entry {
-                hook: "test-hook",
-                entry: "python3 -c 'print(2)'",
-            },
+            entry: Shell(
+                ShellHookEntry {
+                    hook: "test-hook",
+                    entry: "python3 -c 'print(2)'",
+                    shell: Bash,
+                },
+            ),
             language: Python,
             alias: "alias-1",
             files: None,

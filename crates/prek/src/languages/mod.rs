@@ -33,7 +33,7 @@ mod rust;
 mod script;
 mod swift;
 mod system;
-pub mod version;
+pub(crate) mod version;
 
 static BUN: bun::Bun = bun::Bun;
 static DENO: deno::Deno = deno::Deno;
@@ -79,6 +79,12 @@ trait LanguageImpl {
 struct UnimplementedError(String);
 
 struct Unimplemented;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellSupport {
+    Supported,
+    Unsupported(&'static str),
+}
 
 impl LanguageImpl for Unimplemented {
     async fn install(
@@ -129,38 +135,84 @@ impl LanguageImpl for Unimplemented {
 // system: only system version, no env, no additional deps
 
 impl Language {
-    pub fn supported(lang: Language) -> bool {
-        matches!(
-            lang,
+    pub(crate) fn supported(lang: Language) -> bool {
+        match lang {
             Self::Bun
-                | Self::Deno
-                | Self::Docker
-                | Self::DockerImage
-                | Self::Dotnet
-                | Self::Fail
-                | Self::Golang
-                | Self::Haskell
-                | Self::Julia
-                | Self::Lua
-                | Self::Node
-                | Self::Pygrep
-                | Self::Python
-                | Self::Ruby
-                | Self::Rust
-                | Self::Script
-                | Self::Swift
-                | Self::System
-        )
+            | Self::Deno
+            | Self::Docker
+            | Self::DockerImage
+            | Self::Dotnet
+            | Self::Fail
+            | Self::Golang
+            | Self::Haskell
+            | Self::Julia
+            | Self::Lua
+            | Self::Node
+            | Self::Pygrep
+            | Self::Python
+            | Self::Ruby
+            | Self::Rust
+            | Self::Script
+            | Self::Swift
+            | Self::System => true,
+            Self::Conda | Self::Coursier | Self::Dart | Self::Perl | Self::R => false,
+        }
     }
 
-    pub fn supports_install_env(self) -> bool {
-        !matches!(
-            self,
-            Self::DockerImage | Self::Fail | Self::Script | Self::System
-        )
+    pub(crate) fn supports_install_env(self) -> bool {
+        match self {
+            Self::Bun
+            | Self::Conda
+            | Self::Coursier
+            | Self::Dart
+            | Self::Deno
+            | Self::Docker
+            | Self::Dotnet
+            | Self::Golang
+            | Self::Haskell
+            | Self::Julia
+            | Self::Lua
+            | Self::Node
+            | Self::Perl
+            | Self::Pygrep
+            | Self::Python
+            | Self::R
+            | Self::Ruby
+            | Self::Rust
+            | Self::Swift => true,
+            Self::DockerImage | Self::Fail | Self::Script | Self::System => false,
+        }
     }
 
-    pub fn tool_buckets(self) -> &'static [ToolBucket] {
+    pub(crate) fn shell_support(self) -> ShellSupport {
+        match self {
+            Self::Bun
+            | Self::Deno
+            | Self::Dotnet
+            | Self::Golang
+            | Self::Haskell
+            | Self::Lua
+            | Self::Node
+            | Self::Python
+            | Self::Ruby
+            | Self::Script
+            | Self::Swift
+            | Self::System => ShellSupport::Supported,
+            Self::Conda | Self::Coursier | Self::Dart | Self::Perl | Self::R => {
+                ShellSupport::Unsupported("no runner is implemented yet")
+            }
+            Self::Docker | Self::DockerImage => ShellSupport::Unsupported(
+                "`entry` participates in container image or entrypoint selection",
+            ),
+            Self::Fail => ShellSupport::Unsupported("`entry` is the failure message body"),
+            Self::Julia | Self::Rust => ShellSupport::Unsupported(
+                "`entry` participates in install/runtime package resolution and is split before execution",
+            ),
+            Self::Pygrep => ShellSupport::Unsupported("`entry` is the regex pattern"),
+        }
+    }
+
+    pub(crate) fn tool_buckets(self) -> &'static [ToolBucket] {
         match self {
             Self::Bun => &[ToolBucket::Bun],
             Self::Deno => &[ToolBucket::Deno],
@@ -170,55 +222,114 @@ impl Language {
             Self::Python | Self::Pygrep => &[ToolBucket::Uv, ToolBucket::Python],
             Self::Ruby => &[ToolBucket::Ruby],
             Self::Rust => &[ToolBucket::Rustup],
-            _ => &[],
+            Self::Conda
+            | Self::Coursier
+            | Self::Dart
+            | Self::Docker
+            | Self::DockerImage
+            | Self::Fail
+            | Self::Haskell
+            | Self::Julia
+            | Self::Lua
+            | Self::Perl
+            | Self::R
+            | Self::Script
+            | Self::Swift
+            | Self::System => &[],
         }
     }
 
-    pub fn cache_buckets(self) -> &'static [CacheBucket] {
+    pub(crate) fn cache_buckets(self) -> &'static [CacheBucket] {
         match self {
             Self::Deno => &[CacheBucket::Deno],
             Self::Golang => &[CacheBucket::Go],
             Self::Python | Self::Pygrep => &[CacheBucket::Uv, CacheBucket::Python],
             Self::Rust => &[CacheBucket::Cargo],
-            _ => &[],
+            Self::Bun
+            | Self::Conda
+            | Self::Coursier
+            | Self::Dart
+            | Self::Docker
+            | Self::DockerImage
+            | Self::Dotnet
+            | Self::Fail
+            | Self::Haskell
+            | Self::Julia
+            | Self::Lua
+            | Self::Node
+            | Self::Perl
+            | Self::R
+            | Self::Ruby
+            | Self::Script
+            | Self::Swift
+            | Self::System => &[],
         }
     }
 
     /// Return whether the language allows specifying the version, e.g. we can install a specific
     /// requested language version.
     /// See <https://pre-commit.com/#overriding-language-version>
-    pub fn supports_language_version(self) -> bool {
-        matches!(
-            self,
+    pub(crate) fn supports_language_version(self) -> bool {
+        match self {
             Self::Bun
-                | Self::Deno
-                | Self::Dotnet
-                | Self::Golang
-                | Self::Node
-                | Self::Python
-                | Self::Ruby
-                | Self::Rust
-        )
+            | Self::Deno
+            | Self::Dotnet
+            | Self::Golang
+            | Self::Node
+            | Self::Python
+            | Self::Ruby
+            | Self::Rust => true,
+            Self::Conda
+            | Self::Coursier
+            | Self::Dart
+            | Self::Docker
+            | Self::DockerImage
+            | Self::Fail
+            | Self::Haskell
+            | Self::Julia
+            | Self::Lua
+            | Self::Perl
+            | Self::Pygrep
+            | Self::R
+            | Self::Script
+            | Self::Swift
+            | Self::System => false,
+        }
     }
 
     /// Whether the language supports installing dependencies.
     ///
     /// For example, Python and Node.js support installing dependencies, while
     /// System and Fail do not.
-    pub fn supports_dependency(self) -> bool {
-        !matches!(
-            self,
-            Self::DockerImage
-                | Self::Fail
-                | Self::Pygrep
-                | Self::Script
-                | Self::System
-                | Self::Docker
-                | Self::Swift
-        )
+    pub(crate) fn supports_dependency(self) -> bool {
+        match self {
+            Self::Bun
+            | Self::Conda
+            | Self::Coursier
+            | Self::Dart
+            | Self::Deno
+            | Self::Dotnet
+            | Self::Golang
+            | Self::Haskell
+            | Self::Julia
+            | Self::Lua
+            | Self::Node
+            | Self::Perl
+            | Self::Python
+            | Self::R
+            | Self::Ruby
+            | Self::Rust => true,
+            Self::Docker
+            | Self::DockerImage
+            | Self::Fail
+            | Self::Pygrep
+            | Self::Script
+            | Self::Swift
+            | Self::System => false,
+        }
     }
 
-    pub async fn install(
+    pub(crate) async fn install(
         &self,
         hook: Arc<Hook>,
         store: &Store,
@@ -243,11 +354,13 @@ impl Language {
             Self::Script => SCRIPT.install(hook, store, reporter).await,
             Self::Swift => SWIFT.install(hook, store, reporter).await,
             Self::System => SYSTEM.install(hook, store, reporter).await,
-            _ => UNIMPLEMENTED.install(hook, store, reporter).await,
+            Self::Conda | Self::Coursier | Self::Dart | Self::Perl | Self::R => {
+                UNIMPLEMENTED.install(hook, store, reporter).await
+            }
         }
     }
 
-    pub async fn check_health(&self, info: &InstallInfo) -> Result<()> {
+    pub(crate) async fn check_health(&self, info: &InstallInfo) -> Result<()> {
         match self {
             Self::Bun => BUN.check_health(info).await,
             Self::Deno => DENO.check_health(info).await,
@@ -267,12 +380,14 @@ impl Language {
             Self::Script => SCRIPT.check_health(info).await,
             Self::Swift => SWIFT.check_health(info).await,
             Self::System => SYSTEM.check_health(info).await,
-            _ => UNIMPLEMENTED.check_health(info).await,
+            Self::Conda | Self::Coursier | Self::Dart | Self::Perl | Self::R => {
+                UNIMPLEMENTED.check_health(info).await
+            }
         }
     }
 
     #[instrument(level = "trace", skip_all, fields(hook_id = %hook.id, language = %hook.language))]
-    pub async fn run(
+    pub(crate) async fn run(
         &self,
         hook: &InstalledHook,
         filenames: &[&Path],
@@ -320,7 +435,9 @@ impl Language {
             Self::Script => SCRIPT.run(hook, filenames, store, reporter).await,
             Self::Swift => SWIFT.run(hook, filenames, store, reporter).await,
             Self::System => SYSTEM.run(hook, filenames, store, reporter).await,
-            _ => UNIMPLEMENTED.run(hook, filenames, store, reporter).await,
+            Self::Conda | Self::Coursier | Self::Dart | Self::Perl | Self::R => {
+                UNIMPLEMENTED.run(hook, filenames, store, reporter).await
+            }
         }
     }
 }
@@ -330,7 +447,27 @@ pub(crate) async fn extract_metadata(hook: &mut Hook) -> Result<()> {
     match hook.language {
         Language::Python => python::extract_metadata(hook).await,
         Language::Golang => golang::extract_go_mod_metadata(hook).await,
-        _ => Ok(()),
+        Language::Bun
+        | Language::Conda
+        | Language::Coursier
+        | Language::Dart
+        | Language::Deno
+        | Language::Docker
+        | Language::DockerImage
+        | Language::Dotnet
+        | Language::Fail
+        | Language::Haskell
+        | Language::Julia
+        | Language::Lua
+        | Language::Node
+        | Language::Perl
+        | Language::Pygrep
+        | Language::R
+        | Language::Ruby
+        | Language::Rust
+        | Language::Script
+        | Language::Swift
+        | Language::System => Ok(()),
     }
 }
 
