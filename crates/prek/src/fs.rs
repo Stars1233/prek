@@ -26,6 +26,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use anyhow::Context;
 use rustc_hash::FxHashMap;
 #[cfg(test)]
 use rustc_hash::FxHashSet;
@@ -265,6 +266,80 @@ pub fn relative_to(
     Ok(up.join(stripped))
 }
 
+/// Create a symlink to the file, or copy it if symlink creation fails.
+/// Tries symlink first, then falls back to a regular file copy.
+pub(crate) async fn symlink_or_copy(source: &Path, target: &Path) -> anyhow::Result<()> {
+    match fs_err::tokio::symlink_metadata(target).await {
+        Ok(_) => {
+            fs_err::tokio::remove_file(target).await?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    #[cfg(not(windows))]
+    {
+        // Try symlink on Unix systems
+        match fs_err::tokio::symlink(source, target).await {
+            Ok(()) => {
+                trace!(
+                    "Created symlink from {} to {}",
+                    source.display(),
+                    target.display()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                trace!(
+                    "Failed to create symlink from {} to {}: {}",
+                    source.display(),
+                    target.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Try Windows symlink API (requires admin privileges)
+        match fs_err::tokio::symlink_file(source, target).await {
+            Ok(()) => {
+                trace!(
+                    "Created Windows symlink from {} to {}",
+                    source.display(),
+                    target.display()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                trace!(
+                    "Failed to create Windows symlink from {} to {}: {}",
+                    source.display(),
+                    target.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // Fallback to copy
+    trace!(
+        "Falling back to copy from {} to {}",
+        source.display(),
+        target.display()
+    );
+    fs_err::tokio::copy(source, target).await.with_context(|| {
+        format!(
+            "Failed to copy file from {} to {}",
+            source.display(),
+            target.display(),
+        )
+    })?;
+
+    Ok(())
+}
+
 pub trait Simplified {
     /// Simplify a [`Path`].
     ///
@@ -311,6 +386,39 @@ impl<T: AsRef<Path>> Simplified for T {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_or_copy_creates_symlink() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs_err::write(&source, "source content")?;
+
+        super::symlink_or_copy(&source, &target).await?;
+
+        assert!(fs_err::symlink_metadata(&target)?.file_type().is_symlink());
+        assert_eq!(fs_err::read_link(target)?, source);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn symlink_or_copy_replaces_existing_file() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs_err::write(&source, "new content")?;
+        fs_err::write(&target, "old content")?;
+
+        super::symlink_or_copy(&source, &target).await?;
+
+        assert_eq!(fs_err::read_to_string(&target)?, "new content");
+        #[cfg(unix)]
+        assert!(fs_err::symlink_metadata(&target)?.file_type().is_symlink());
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn lock_warning_suppressed_for_in_process_contention() {
