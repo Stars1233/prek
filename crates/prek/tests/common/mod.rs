@@ -169,12 +169,34 @@ impl TestContext {
             cmd
         };
 
+        cmd.env(
+            EnvVars::PREK_INTERNAL__USER_CONFIG_PATH,
+            self.user_config_path().path(),
+        );
+
         // Disable git autocrlf to avoid line ending issues in tests.
         cmd.env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "core.autocrlf")
             .env("GIT_CONFIG_VALUE_0", "false");
 
         cmd
+    }
+
+    fn user_config_path(&self) -> ChildPath {
+        self.home_dir
+            .child("config")
+            .child("prek")
+            .child("prek.toml")
+    }
+
+    pub fn write_user_config(&self, content: &str) {
+        let config_dir = self.home_dir.child("config").child("prek");
+        config_dir
+            .create_dir_all()
+            .expect("Failed to create user config directory");
+        self.user_config_path()
+            .write_str(content)
+            .expect("Failed to write user config");
     }
 
     pub fn run(&self) -> Command {
