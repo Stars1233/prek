@@ -6,7 +6,6 @@ use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
-use mea::once::OnceCell;
 use mea::semaphore::Semaphore;
 use owo_colors::OwoColorize;
 use prek_consts::env_vars::EnvVars;
@@ -18,8 +17,11 @@ use tracing::{debug, trace, warn};
 use unicode_width::UnicodeWidthStr;
 
 use crate::cli::reporter::{HookInitReporter, HookInstallReporter, HookRunReporter};
+use crate::cli::run::filter::HookFileFilter;
 use crate::cli::run::keeper::WorkTreeKeeper;
-use crate::cli::run::{CollectOptions, FileFilter, RunInput, Selectors, collect_run_input};
+use crate::cli::run::{
+    CollectOptions, FileTagCache, ProjectFiles, RunInput, Selectors, collect_run_input,
+};
 use crate::cli::{ExitStatus, RunExtraArgs};
 use crate::config::{Language, PassFilenames, Stage};
 use crate::fs::CWD;
@@ -266,14 +268,14 @@ fn set_env_vars(from_ref: Option<&String>, to_ref: Option<&String>, args: &RunEx
 #[derive(Debug)]
 struct LazyInstallInfo {
     info: Arc<InstallInfo>,
-    health: OnceCell<bool>,
+    health: mea::once::OnceCell<bool>,
 }
 
 impl LazyInstallInfo {
     fn new(info: Arc<InstallInfo>) -> Self {
         Self {
             info,
-            health: OnceCell::new(),
+            health: mea::once::OnceCell::new(),
         }
     }
 
@@ -571,8 +573,11 @@ impl StatusPrinter {
 }
 
 enum ProjectHookInput<'a> {
-    Files(FileFilter<'a>),
-    MessageFile(PathBuf),
+    Files(ProjectFiles<'a>),
+    MessageFile {
+        absolute_path: &'a Path,
+        hook_arg: PathBuf,
+    },
 }
 
 impl<'a> ProjectHookInput<'a> {
@@ -582,32 +587,43 @@ impl<'a> ProjectHookInput<'a> {
         consumed_files: Option<&mut FxHashSet<&'a Path>>,
     ) -> Result<Self> {
         match input {
-            RunInput::Files(files) => Ok(Self::Files(FileFilter::for_project(
+            RunInput::Files(files) => Ok(Self::Files(ProjectFiles::for_project(
                 files.iter(),
                 project,
                 consumed_files,
             ))),
-            RunInput::MessageFile(path) => Ok(Self::MessageFile(fs::normalize_path(
-                fs::relative_to(path, project.path())?,
-            ))),
+            RunInput::MessageFile(path) => Ok(Self::MessageFile {
+                absolute_path: path,
+                hook_arg: fs::normalize_path(fs::relative_to(path, project.path())?),
+            }),
         }
     }
 
     fn len(&self) -> usize {
         match self {
-            Self::Files(filter) => filter.len(),
-            Self::MessageFile(_) => 1,
+            Self::Files(project_files) => project_files.len(),
+            Self::MessageFile { .. } => 1,
         }
     }
 
-    fn for_hook(&self, hook: &Hook) -> Vec<&Path> {
+    fn for_hook(&self, hook: &Hook, tag_cache: &mut FileTagCache) -> Vec<&Path> {
         match self {
-            Self::Files(filter) => filter.for_hook(hook),
-            Self::MessageFile(path) => {
-                // `commit-msg` and `prepare-commit-msg` receive Git's message file, which is not
-                // a workspace file. The `files`/`exclude`/`types` filters are workspace-file
-                // selectors, so they do not apply to this hook argument.
-                vec![path.as_path()]
+            Self::Files(project_files) => project_files.for_hook(hook, tag_cache),
+            Self::MessageFile {
+                absolute_path,
+                hook_arg,
+            } => {
+                // `commit-msg` and `prepare-commit-msg` receive Git's special message file,
+                // which can live outside a project root, so it bypasses project ownership
+                // filtering. Hook-level `files`/`exclude`/`types` filters still apply.
+                let hook_filter = HookFileFilter::new(hook);
+                if hook_filter.matches_filename(hook_arg)
+                    && hook_filter.matches_tags(tag_cache.tags(absolute_path))
+                {
+                    vec![hook_arg.as_path()]
+                } else {
+                    vec![]
+                }
             }
         }
     }
@@ -650,6 +666,7 @@ async fn run_hooks(
 
     // Track files that have been consumed by orphan projects.
     let mut consumed_files = FxHashSet::default();
+    let mut tag_cache = FileTagCache::default();
 
     'outer: for project in workspace.all_projects() {
         let project_input = ProjectHookInput::new(&input, project, Some(&mut consumed_files))?;
@@ -683,8 +700,15 @@ async fn run_hooks(
 
         for group_range in PriorityGroupRanges::new(&hooks) {
             let group_hooks = hooks[group_range].to_vec();
-            let mut group_results =
-                run_priority_group(group_hooks, &project_input, store, dry_run, &reporter).await?;
+            let mut group_results = run_priority_group(
+                group_hooks,
+                &project_input,
+                &mut tag_cache,
+                store,
+                dry_run,
+                &reporter,
+            )
+            .await?;
 
             // Print results in a stable order (same order as config within the project).
             group_results.sort_unstable_by_key(|a| a.hook.idx);
@@ -813,6 +837,7 @@ impl Iterator for PriorityGroupRanges<'_> {
 async fn run_priority_group(
     group_hooks: Vec<InstalledHook>,
     input: &ProjectHookInput<'_>,
+    tag_cache: &mut FileTagCache,
     store: &Store,
     dry_run: bool,
     reporter: &HookRunReporter,
@@ -824,12 +849,17 @@ async fn run_priority_group(
         group_hooks.iter().map(|h| &h.id).collect::<Vec<_>>()
     );
 
-    let mut results = futures::stream::iter(
-        group_hooks
-            .into_iter()
-            .map(|hook| run_hook(hook, input, store, dry_run, reporter)),
-    )
-    .buffer_unordered(*CONCURRENCY);
+    let mut results = futures::stream::iter(group_hooks)
+        .map(|hook| {
+            let filenames = input.for_hook(&hook, tag_cache);
+            trace!(
+                "Files for hook `{}` after filtered: {}",
+                hook.id,
+                filenames.len()
+            );
+            run_hook(hook, filenames, store, dry_run, reporter)
+        })
+        .buffer_unordered(*CONCURRENCY);
 
     let mut group_results = Vec::new();
     while let Some(result) = results.next().await {
@@ -1043,18 +1073,11 @@ impl RunResult {
 
 async fn run_hook(
     hook: InstalledHook,
-    input: &ProjectHookInput<'_>,
+    mut filenames: Vec<&Path>,
     store: &Store,
     dry_run: bool,
     reporter: &HookRunReporter,
 ) -> Result<RunResult> {
-    let mut filenames = input.for_hook(&hook);
-    trace!(
-        "Files for hook `{}` after filtered: {}",
-        hook.id,
-        filenames.len()
-    );
-
     if filenames.is_empty() && !hook.always_run {
         return Ok(RunResult::from_status(hook, RunStatus::NoFiles));
     }

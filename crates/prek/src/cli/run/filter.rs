@@ -5,7 +5,7 @@ use itertools::{Either, Itertools};
 use path_clean::PathClean;
 use prek_consts::env_vars::EnvVars;
 use prek_identify::{TagSet, tags_from_path};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, error, instrument};
 
 use crate::config::{FilePattern, Stage};
@@ -25,7 +25,7 @@ impl<'a> FilenameFilter<'a> {
         Self { include, exclude }
     }
 
-    pub(crate) fn filter(&self, filename: &Path) -> bool {
+    pub(crate) fn matches(&self, filename: &Path) -> bool {
         if let Some(pattern) = &self.include {
             if !pattern.is_match(filename) {
                 return false;
@@ -60,7 +60,7 @@ impl<'a> FileTagFilter<'a> {
         }
     }
 
-    pub(crate) fn filter(&self, file_types: &TagSet) -> bool {
+    pub(crate) fn matches(&self, file_types: &TagSet) -> bool {
         if self.all.is_some_and(|s| !s.is_subset(file_types)) {
             return false;
         }
@@ -77,15 +77,82 @@ impl<'a> FileTagFilter<'a> {
     }
 }
 
-pub(crate) struct FileFilter<'a> {
-    filenames: Vec<&'a Path>,
-    filename_prefix: PathBuf,
+pub(crate) struct HookFileFilter<'a> {
+    filename: FilenameFilter<'a>,
+    tags: FileTagFilter<'a>,
 }
 
-impl<'a> FileFilter<'a> {
-    /// Create a `FileFilter` for a project by filtering the input filenames with the project's relative path and include/exclude patterns.
+impl<'a> HookFileFilter<'a> {
+    pub(crate) fn new(hook: &'a Hook) -> Self {
+        Self {
+            filename: FilenameFilter::new(hook.files.as_ref(), hook.exclude.as_ref()),
+            tags: FileTagFilter::new(
+                Some(&hook.types),
+                Some(&hook.types_or),
+                Some(&hook.exclude_types),
+            ),
+        }
+    }
+
+    pub(crate) fn matches_filename(&self, filename: &Path) -> bool {
+        self.filename.matches(filename)
+    }
+
+    pub(crate) fn matches_tags(&self, tags: Option<&TagSet>) -> bool {
+        tags.is_some_and(|tags| self.tags.matches(tags))
+    }
+
+    fn matches_project_file(&self, file: &ProjectFile<'_>, tag_cache: &mut FileTagCache) -> bool {
+        self.matches_filename(file.hook_path) && self.matches_tags(file.tags(tag_cache))
+    }
+}
+
+struct ProjectFile<'a> {
+    workspace_path: &'a Path,
+    hook_path: &'a Path,
+}
+
+impl<'a> ProjectFile<'a> {
+    fn new(workspace_path: &'a Path, hook_path: &'a Path) -> Self {
+        Self {
+            workspace_path,
+            hook_path,
+        }
+    }
+
+    fn tags<'cache>(&self, tag_cache: &'cache mut FileTagCache) -> Option<&'cache TagSet> {
+        tag_cache.tags(self.workspace_path)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FileTagCache {
+    tags_by_path: FxHashMap<PathBuf, Option<TagSet>>,
+}
+
+impl FileTagCache {
+    pub(crate) fn tags(&mut self, path: &Path) -> Option<&TagSet> {
+        if !self.tags_by_path.contains_key(path) {
+            let tags = match tags_from_path(path) {
+                Ok(tags) => Some(tags),
+                Err(err) => {
+                    error!(filename = ?path.display(), error = %err, "Failed to get tags");
+                    None
+                }
+            };
+            self.tags_by_path.insert(path.to_path_buf(), tags);
+        }
+        self.tags_by_path.get(path).and_then(Option::as_ref)
+    }
+}
+
+pub(crate) struct ProjectFiles<'a> {
+    files: Vec<ProjectFile<'a>>,
+}
+
+impl<'a> ProjectFiles<'a> {
+    /// Create project-owned files after applying the project's relative path and include/exclude patterns.
     /// `filenames` are paths relative to the workspace root.
-    #[instrument(level = "trace", skip_all, fields(project = %project))]
     pub(crate) fn for_project<I>(
         filenames: I,
         project: &Project,
@@ -94,7 +161,7 @@ impl<'a> FileFilter<'a> {
     where
         I: Iterator<Item = &'a PathBuf> + Send,
     {
-        let filter = FilenameFilter::new(
+        let filename_filter = FilenameFilter::new(
             project.config().files.as_ref(),
             project.config().exclude.as_ref(),
         );
@@ -106,7 +173,7 @@ impl<'a> FileFilter<'a> {
         // *before* applying the project's include/exclude patterns. This ensures that even
         // files excluded by this project are still considered "owned" by it and hidden
         // from parent projects.
-        let filenames = filenames
+        let files = filenames
             .map(PathBuf::as_path)
             // Collect files that are inside the hook project directory.
             .filter(|filename| filename.starts_with(relative_path))
@@ -122,22 +189,23 @@ impl<'a> FileFilter<'a> {
                 }
             })
             // Strip the project-relative prefix before applying project-level include/exclude patterns.
-            .filter(|filename| {
+            .filter_map(|filename| {
                 let relative = filename
                     .strip_prefix(relative_path)
                     .expect("Filename should start with project relative path");
-                filter.filter(relative)
+                if filename_filter.matches(relative) {
+                    Some(ProjectFile::new(filename, relative))
+                } else {
+                    None
+                }
             })
             .collect::<Vec<_>>();
 
-        Self {
-            filenames,
-            filename_prefix: relative_path.to_path_buf(),
-        }
+        Self { files }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.filenames.len()
+        self.files.len()
     }
 
     /// Filter filenames by type tags for a specific hook.
@@ -146,61 +214,30 @@ impl<'a> FileFilter<'a> {
         types: Option<&TagSet>,
         types_or: Option<&TagSet>,
         exclude_types: Option<&TagSet>,
+        tag_cache: &mut FileTagCache,
     ) -> Vec<&Path> {
-        let filter = FileTagFilter::new(types, types_or, exclude_types);
-        let filenames: Vec<_> = self
-            .filenames
-            .iter()
-            .filter(|filename| match tags_from_path(filename) {
-                Ok(tags) => filter.filter(&tags),
-                Err(err) => {
-                    error!(filename = ?filename.display(), error = %err, "Failed to get tags");
-                    false
+        let tag_filter = FileTagFilter::new(types, types_or, exclude_types);
+        let mut filenames = Vec::new();
+        for file in &self.files {
+            if let Some(tags) = file.tags(tag_cache) {
+                if tag_filter.matches(tags) {
+                    filenames.push(file.workspace_path);
                 }
-            })
-            .copied()
-            .collect();
-
+            }
+        }
         filenames
     }
 
     /// Filter filenames by file patterns and tags for a specific hook.
     #[instrument(level = "trace", skip_all, fields(hook = ?hook.id))]
-    pub(crate) fn for_hook(&self, hook: &Hook) -> Vec<&Path> {
-        // Filter by hook `files` and `exclude` patterns.
-        let filter = FilenameFilter::new(hook.files.as_ref(), hook.exclude.as_ref());
-
-        let filenames = self.filenames.iter().filter(|filename| {
-            // Strip the project-relative prefix before applying hook-level include/exclude patterns.
-            if let Ok(relative) = filename.strip_prefix(&self.filename_prefix) {
-                filter.filter(relative)
-            } else {
-                false
+    pub(crate) fn for_hook(&self, hook: &Hook, tag_cache: &mut FileTagCache) -> Vec<&Path> {
+        let hook_filter = HookFileFilter::new(hook);
+        let mut filenames = Vec::new();
+        for file in &self.files {
+            if hook_filter.matches_project_file(file, tag_cache) {
+                filenames.push(file.hook_path);
             }
-        });
-
-        // Filter by hook `types`, `types_or` and `exclude_types`.
-        let filter = FileTagFilter::new(
-            Some(&hook.types),
-            Some(&hook.types_or),
-            Some(&hook.exclude_types),
-        );
-        let filenames = filenames.filter(|filename| match tags_from_path(filename) {
-            Ok(tags) => filter.filter(&tags),
-            Err(err) => {
-                error!(filename = ?filename.display(), error = %err, "Failed to get tags");
-                false
-            }
-        });
-
-        // Strip the prefix to get relative paths.
-        let filenames: Vec<_> = filenames
-            .map(|p| {
-                p.strip_prefix(&self.filename_prefix)
-                    .expect("Filename should start with project relative path")
-            })
-            .collect();
-
+        }
         filenames
     }
 }
@@ -443,9 +480,9 @@ mod tests {
         let exclude = glob_pattern("src/**/ignored.rs");
         let filter = FilenameFilter::new(Some(&include), Some(&exclude));
 
-        assert!(filter.filter(Path::new("src/lib/main.rs")));
-        assert!(!filter.filter(Path::new("src/lib/ignored.rs")));
-        assert!(!filter.filter(Path::new("tests/main.rs")));
+        assert!(filter.matches(Path::new("src/lib/main.rs")));
+        assert!(!filter.matches(Path::new("src/lib/ignored.rs")));
+        assert!(!filter.matches(Path::new("tests/main.rs")));
     }
 
     #[cfg(unix)]
@@ -457,7 +494,7 @@ mod tests {
         let path = Path::new(OsStr::from_bytes(b"bad-\xff.py"));
         let filter = FilenameFilter::new(None, None);
 
-        assert!(filter.filter(path));
+        assert!(filter.matches(path));
     }
 
     #[cfg(unix)]
@@ -471,11 +508,11 @@ mod tests {
         let path = Path::new(OsStr::from_bytes(b"bad-\xff.py"));
         let filter = FilenameFilter::new(Some(&include), None);
 
-        assert!(filter.filter(path));
+        assert!(filter.matches(path));
 
         let filter = FilenameFilter::new(None, Some(&exclude));
 
-        assert!(!filter.filter(path));
+        assert!(!filter.matches(path));
     }
 
     #[cfg(unix)]
@@ -488,6 +525,6 @@ mod tests {
         let path = Path::new(OsStr::from_bytes(b"bad-\xff.py"));
         let filter = FilenameFilter::new(Some(&include), None);
 
-        assert!(!filter.filter(path));
+        assert!(!filter.matches(path));
     }
 }
