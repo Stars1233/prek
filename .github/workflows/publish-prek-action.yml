@@ -3,6 +3,10 @@ name: "Publish prek-action known versions"
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      plan:
+        required: false
+        type: string
     secrets:
       PREK_ACTION_TOKEN:
         required: true
