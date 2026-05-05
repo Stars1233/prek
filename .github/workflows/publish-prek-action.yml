@@ -1,11 +1,8 @@
 name: "Publish prek-action known versions"
 
 on:
+  workflow_dispatch:
   workflow_call:
-    inputs:
-      plan:
-        required: true
-        type: string
     secrets:
       PREK_ACTION_TOKEN:
         required: true
@@ -18,8 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: release
-    env:
-      PLAN: ${{ inputs.plan }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -72,7 +67,6 @@ jobs:
             version-manifest.json
             src/known-checksums.ts
             dist/index.cjs
-            dist/post/index.cjs
           branch: automation/update-known-versions
           base: main
           commit-message: ${{ steps.refresh.outputs.pr_title }}
