@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use futures::{StreamExt, TryStreamExt};
 use rustc_hash::FxHashMap;
+use semver::Version;
 
 use crate::cli::ExitStatus;
 use crate::cli::auto_update::config::write_new_config;
@@ -149,10 +150,44 @@ struct FrozenRef {
 struct TagTimestamp {
     /// The tag name without the `refs/tags/` prefix.
     tag: String,
+    /// The parsed semantic version, if the tag looks like one.
+    version: Option<Version>,
     /// The tag timestamp used for cooldown ordering.
     timestamp: u64,
     /// The peeled commit SHA the tag ultimately points at.
     commit: String,
+}
+
+impl TagTimestamp {
+    fn new(tag: String, timestamp: u64, commit: String) -> Self {
+        let version = Version::parse(tag.strip_prefix('v').unwrap_or(&tag)).ok();
+        Self {
+            tag,
+            version,
+            timestamp,
+            commit,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SkippedDowngrade {
+    /// The configured revision that was kept.
+    current: String,
+    /// The candidate tag that was rejected.
+    candidate: String,
+    /// The cooldown window used to select the candidate tag.
+    cooldown_days: u8,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RevisionSelection {
+    /// No eligible revision was found.
+    Unchanged,
+    /// Update to this revision.
+    Update(String),
+    /// Keep the current revision because the candidate sorts older.
+    SkippedDowngrade(SkippedDowngrade),
 }
 
 struct TagFilters {
@@ -239,6 +274,8 @@ fn build_repo_tag_patterns(
 struct ResolvedRepoUpdate<'a> {
     /// The revision data that may be written back to config.
     revision: Revision,
+    /// A candidate revision that was not selected because it would move backward.
+    skipped_downgrade: Option<SkippedDowngrade>,
     /// Any stale `# frozen:` comments found for this target's usages.
     frozen_mismatches: Vec<FrozenMismatch<'a>>,
 }
@@ -279,11 +316,28 @@ struct ApplyRepoUpdatesResult {
 }
 
 enum DisplayEventKind {
-    Update { current: Revision, next: Revision },
-    FrozenUpdate { current: String, next: String },
-    FrozenRemove { current: String },
-    UpToDate { current: Revision },
-    Failure { error: String },
+    Update {
+        current: Revision,
+        next: Revision,
+    },
+    SkippedDowngrade {
+        current: String,
+        candidate: String,
+        cooldown_days: u8,
+    },
+    FrozenUpdate {
+        current: String,
+        next: String,
+    },
+    FrozenRemove {
+        current: String,
+    },
+    UpToDate {
+        current: Revision,
+    },
+    Failure {
+        error: String,
+    },
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -390,11 +444,7 @@ mod tests {
     use super::*;
 
     fn tag(name: &str) -> TagTimestamp {
-        TagTimestamp {
-            tag: name.to_string(),
-            timestamp: 0,
-            commit: String::new(),
-        }
+        TagTimestamp::new(name.to_string(), 0, String::new())
     }
 
     fn filtered_tags(filters: &TagFilters, repo: &str, tags: &[TagTimestamp]) -> Vec<String> {
